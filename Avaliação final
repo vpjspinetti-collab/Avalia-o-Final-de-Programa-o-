@@ -1,0 +1,342 @@
+# =========================
+# Simulador de Pena (Brasil) – Streamlit
+# Fases: 1) Pena-base (art. 59) -> 2) Agravantes/Atenuantes -> 3) Majorantes/Minorantes
+# Extras: regime inicial (art. 33) e substituição (art. 44)
+# Interface: mínima/máxima em ANOS (inteiros); pena-base em anos/meses/dias
+# =========================
+
+from dataclasses import dataclass, field
+from typing import List, Tuple
+import textwrap
+import streamlit as st
+
+# ---------- utilidades de tempo ----------
+def anos_meses_dias_para_dias(a: int, m: int, d: int) -> int:
+    # convenção didática: 1 mês = 30 dias
+    return a*365 + m*30 + d
+
+def dias_para_anos_meses_dias(total_dias: int) -> Tuple[int,int,int]:
+    a = total_dias // 365
+    resto = total_dias % 365
+    m = resto // 30
+    d = resto % 30
+    return a, m, d
+
+def clamp(x, minimo, maximo):
+    return max(min(x, maximo), minimo)
+
+# ---------- configuração padrão ----------
+@dataclass
+class ConfigSimulador:
+    passo_ag_at: float = 1/6     # passo padrão para agravantes/atenuantes
+    cumular_majorantes: bool = True
+    cumular_minorantes: bool = True
+    travar_no_minimo_fase1: bool = True
+    travar_no_maximo_fase1: bool = True
+    travar_no_minmax_final: bool = True
+    considerar_circ_desfav_no_regime: bool = True
+
+# ---------- entrada do caso ----------
+@dataclass
+class CasoPenal:
+    # limites abstratos (somente anos informados; meses/dias = 0)
+    minimo_anos: int
+    maximo_anos: int
+
+    # pena-base escolhida (fase 1)
+    base_anos: int
+    base_meses: int
+    base_dias: int
+
+    # circunstâncias judiciais desfavoráveis (art. 59)
+    circ_judiciais_desfavoraveis: int = 0
+
+    # fase 2
+    n_agravantes: int = 0
+    n_atenuantes: int = 0
+
+    # fase 3: listas de frações (ex.: 1/3, 2/3, 1/6 etc.)
+    majorantes: List[float] = field(default_factory=list)
+    minorantes: List[float] = field(default_factory=list)
+
+    # dados para regime/substituição
+    reincidente: bool = False
+    houve_violencia_ou_grave_ameaca: bool = False
+
+# ---------- motor do simulador ----------
+@dataclass
+class Resultado:
+    pena_fase1_dias: int
+    pena_fase2_dias: int
+    pena_fase3_dias: int
+    regime_inicial: str
+    substituivel_por_restritiva: bool
+
+def simular(caso: CasoPenal, cfg: ConfigSimulador = ConfigSimulador()) -> Resultado:
+    # limites abstratos
+    min_d = anos_meses_dias_para_dias(caso.minimo_anos, 0, 0)
+    max_d = anos_meses_dias_para_dias(caso.maximo_anos, 0, 0)
+
+    # fase 1: pena-base
+    pb_d = anos_meses_dias_para_dias(caso.base_anos, caso.base_meses, caso.base_dias)
+    if cfg.travar_no_minimo_fase1: pb_d = max(pb_d, min_d)
+    if cfg.travar_no_maximo_fase1: pb_d = min(pb_d, max_d)
+
+    # fase 2: agravantes/atenuantes
+    delta_factor = (1 + cfg.passo_ag_at*caso.n_agravantes - cfg.passo_ag_at*caso.n_atenuantes)
+    f2_d = int(round(pb_d * max(0, delta_factor)))
+    f2_d = clamp(f2_d, min_d, max_d)
+
+    # fase 3: causas de aumento/diminuição
+    f3 = f2_d
+    if cfg.cumular_majorantes:
+        for frac in caso.majorantes:
+            f3 = int(round(f3 * (1 + frac)))
+    else:
+        if caso.majorantes:
+            f3 = int(round(f3 * (1 + max(caso.majorantes))))
+
+    if cfg.cumular_minorantes:
+        for frac in caso.minorantes:
+            f3 = int(round(f3 * (1 - frac)))
+    else:
+        if caso.minorantes:
+            f3 = int(round(f3 * (1 - max(caso.minorantes))))
+
+    if cfg.travar_no_minmax_final:
+        f3 = clamp(f3, min_d, max_d)
+
+    # regime inicial (heurística art. 33 CP)
+    anos, _, _ = dias_para_anos_meses_dias(f3)
+    regime = "Aberto"
+    if anos > 8:
+        regime = "Fechado"
+    elif anos > 4:
+        regime = "Semiaberto"
+    else:
+        if caso.reincidente or (cfg.considerar_circ_desfav_no_regime and caso.circ_judiciais_desfavoraveis > 0):
+            regime = "Semiaberto"
+
+    # substituição por restritivas (art. 44 CP) – critérios simplificados
+    substituivel = (not caso.reincidente) and (not caso.houve_violencia_ou_grave_ameaca) and (f3 <= anos_meses_dias_para_dias(4,0,0))
+
+    return Resultado(
+        pena_fase1_dias=pb_d,
+        pena_fase2_dias=f2_d,
+        pena_fase3_dias=f3,
+        regime_inicial=regime,
+        substituivel_por_restritiva=substituivel
+    )
+
+def formatar_pena(dias: int) -> str:
+    a, m, d = dias_para_anos_meses_dias(dias)
+    partes = []
+    if a: partes.append(f"{a} ano{'s' if a>1 else ''}")
+    if m: partes.append(f"{m} mês{'es' if m>1 else ''}")
+    if d or not partes: partes.append(f"{d} dia{'s' if d!=1 else ''}")
+    return " ".join(partes)
+
+def parse_fracoes(txt: str) -> List[float]:
+    """
+    Ex.: "1/3, 2/3, 1/6" -> [0.333..., 0.666..., 0.166...]
+         "0.5, 0.2"      -> [0.5, 0.2]
+    Ignora entradas inválidas.
+    """
+    txt = (txt or "").strip()
+    if not txt:
+        return []
+    frs = []
+    for pedaco in txt.split(","):
+        t = pedaco.strip()
+        if not t:
+            continue
+        if "/" in t:
+            try:
+                num, den = t.split("/")
+                frs.append(float(num)/float(den))
+            except Exception:
+                continue
+        else:
+            try:
+                frs.append(float(t))
+            except Exception:
+                continue
+    frs = [f for f in frs if f >= 0]
+    return frs
+
+def frac_list_str(lst: List[float]) -> str:
+    return ", ".join([f"{int(f*100)}%" for f in lst]) if lst else "nenhuma"
+
+def gerar_relatorio_texto(caso: CasoPenal, cfg: ConfigSimulador, res: Resultado) -> str:
+    linhas = []
+    linhas.append("=== RELATÓRIO DO CÁLCULO DA PENA ===")
+    linhas.append("")
+    linhas.append(f"Limites abstratos do tipo penal: mínimo {caso.minimo_anos} ano(s) · máximo {caso.maximo_anos} ano(s)")
+    linhas.append("")
+    linhas.append("FASE 1 – Pena-base (art. 59):")
+    linhas.append(f"- Pena-base informada: {caso.base_anos}a {caso.base_meses}m {caso.base_dias}d")
+    linhas.append(f"- Circunstâncias judiciais desfavoráveis: {caso.circ_judiciais_desfavoraveis}")
+    linhas.append(f"- Resultado Fase 1: {formatar_pena(res.pena_fase1_dias)}")
+    linhas.append("")
+    linhas.append("FASE 2 – Agravantes/Atenuantes:")
+    linhas.append(f"- Agravantes: {caso.n_agravantes} | Atenuantes: {caso.n_atenuantes} | Passo: {int(cfg.passo_ag_at*100)}%")
+    linhas.append(f"- Resultado Fase 2: {formatar_pena(res.pena_fase2_dias)}")
+    linhas.append("")
+    linhas.append("FASE 3 – Causas de Aumento/Redução:")
+    linhas.append(f"- Majorantes: {frac_list_str(caso.majorantes)} (cumular={'sim' if cfg.cumular_majorantes else 'não'})")
+    linhas.append(f"- Minorantes: {frac_list_str(caso.minorantes)} (cumular={'sim' if cfg.cumular_minorantes else 'não'})")
+    linhas.append(f"- PENA FINAL: {formatar_pena(res.pena_fase3_dias)}")
+    linhas.append("")
+    linhas.append("REGIME E SUBSTITUIÇÃO:")
+    linhas.append(f"- Regime inicial (heurística art. 33 CP): {res.regime_inicial}")
+    linhas.append(f"- Substituição por restritivas (art. 44 CP): {'Possível (em tese)' if res.substituivel_por_restritiva else 'Não elegível (em tese)'}")
+    linhas.append("")
+    linhas.append(textwrap.fill("Observação: parâmetros e heurísticas são didáticos e podem variar conforme lei especial, súmulas e precedentes.", width=88))
+    return "\n".join(linhas)
+
+# =========================
+# Interface Streamlit
+# =========================
+st.set_page_config(page_title="Simulador de Pena (CP - BR)", page_icon="⚖️", layout="centered")
+st.title("⚖️ Simulador de Pena – Brasil (três fases)")
+st.caption("Ferramenta didática. Parâmetros podem variar conforme lei especial e jurisprudência.")
+
+with st.sidebar:
+    st.header("Configurações")
+    passo = st.selectbox(
+        "Passo Agrav./Atenuantes",
+        options=[1/8, 1/6, 1/5, 1/4, 1/3, 1/2],
+        index=1,
+        format_func=lambda x: f"{int(x*100)}% por ocorrência"
+    )
+    cum_maj = st.toggle("Cumular TODAS as majorantes", value=True)
+    cum_min = st.toggle("Cumular TODAS as minorantes", value=True)
+    travar_f1_min = st.toggle("Travar Fase 1 no mínimo abstrato", value=True)
+    travar_f1_max = st.toggle("Travar Fase 1 no máximo abstrato", value=True)
+    travar_final = st.toggle("Travar pena final em min/máx abstratos", value=True)
+    considerar_circ = st.toggle("Considerar circunst. desfav. no regime (art. 33)", value=True)
+
+cfg = ConfigSimulador(
+    passo_ag_at=passo,
+    cumular_majorantes=cum_maj,
+    cumular_minorantes=cum_min,
+    travar_no_minimo_fase1=travar_f1_min,
+    travar_no_maximo_fase1=travar_f1_max,
+    travar_no_minmax_final=travar_final,
+    considerar_circ_desfav_no_regime=considerar_circ
+)
+
+st.subheader("Limites abstratos (somente ANOS)")
+col1, col2 = st.columns(2)
+with col1:
+    min_anos = st.number_input("Pena mínima cominada (ANOS)", min_value=0, max_value=100, value=1, step=1)
+with col2:
+    max_anos = st.number_input("Pena máxima cominada (ANOS)", min_value=max(min_anos,1), max_value=200, value=max(min_anos+7, 8), step=1)
+
+st.subheader("Pena-base (art. 59)")
+c1, c2, c3 = st.columns(3)
+with c1:
+    base_a = st.number_input("Anos", min_value=0, max_value=200, value=min_anos, step=1)
+with c2:
+    base_m = st.number_input("Meses", min_value=0, max_value=11, value=0, step=1)
+with c3:
+    base_d = st.number_input("Dias", min_value=0, max_value=29, value=0, step=1)
+
+cjd = st.slider("Circunstâncias judiciais desfavoráveis (0-8)", 0, 8, 1)
+st.divider()
+
+st.subheader("Fase 2 – Agravantes / Atenuantes")
+c4, c5 = st.columns(2)
+with c4:
+    n_agrav = st.number_input("Quantidade de agravantes", min_value=0, max_value=20, value=1, step=1)
+with c5:
+    n_atenu = st.number_input("Quantidade de atenuantes", min_value=0, max_value=20, value=0, step=1)
+
+st.subheader("Fase 3 – Causas de Aumento / Diminuição")
+maj_txt = st.text_input("Majorantes (ex.: 1/3, 2/3 ou 0.5)", value="1/3")
+min_txt = st.text_input("Minorantes (ex.: 1/6 ou 0.2)", value="1/6")
+majorantes = parse_fracoes(maj_txt)
+minorantes = parse_fracoes(min_txt)
+
+st.subheader("Dados do réu")
+colr1, colr2 = st.columns(2)
+with colr1:
+    reincidente = st.toggle("Reincidente", value=False)
+with colr2:
+    violencia = st.toggle("Houve violência ou grave ameaça", value=False)
+
+# Botões de ação
+colb1, colb2, colb3 = st.columns(3)
+executar = colb1.button("Calcular Pena")
+preset = colb2.button("Exemplo Rápido")
+limpar = colb3.button("Limpar")
+
+if preset:
+    min_anos = 1
+    max_anos = 8
+    base_a, base_m, base_d = 2, 0, 0
+    cjd = 1
+    n_agrav, n_atenu = 1, 0
+    majorantes = [1/3]
+    minorantes = [1/6]
+    reincidente = False
+    violencia = False
+    st.info("Exemplo carregado. Clique em **Calcular Pena** para ver o resultado.")
+
+if limpar:
+    st.experimental_rerun()
+
+if executar:
+    # Validações simples
+    if max_anos < min_anos:
+        st.error("A pena máxima deve ser maior ou igual à pena mínima.")
+        st.stop()
+
+    caso = CasoPenal(
+        minimo_anos=min_anos,
+        maximo_anos=max_anos,
+        base_anos=base_a,
+        base_meses=base_m,
+        base_dias=base_d,
+        circ_judiciais_desfavoraveis=cjd,
+        n_agravantes=n_agrav,
+        n_atenuantes=n_atenu,
+        majorantes=majorantes,
+        minorantes=minorantes,
+        reincidente=reincidente,
+        houve_violencia_ou_grave_ameaca=violencia
+    )
+
+    res = simular(caso, cfg)
+
+    st.success("Cálculo concluído.")
+    st.markdown("### Relatório do Cálculo da Pena")
+    st.markdown(f"**Limites abstratos:** mínimo **{min_anos} ano(s)** · máximo **{max_anos} ano(s)**")
+
+    st.markdown("#### Fase 1 – Pena-base (art. 59)")
+    st.write(f"- Pena-base informada: **{base_a}a {base_m}m {base_d}d**")
+    st.write(f"- Circunstâncias judiciais desfavoráveis: **{cjd}**")
+    st.write(f"- **Resultado Fase 1:** {formatar_pena(res.pena_fase1_dias)}")
+
+    st.markdown("#### Fase 2 – Agravantes/Atenuantes")
+    st.write(f"- Agravantes: **{n_agrav}** | Atenuantes: **{n_atenu}** | Passo: **{int(cfg.passo_ag_at*100)}%**")
+    st.write(f"- **Resultado Fase 2:** {formatar_pena(res.pena_fase2_dias)}")
+
+    st.markdown("#### Fase 3 – Causas de Aumento/Redução")
+    st.write(f"- Majorantes aplicadas: {frac_list_str(majorantes)} (cumular={'sim' if cfg.cumular_majorantes else 'não'})")
+    st.write(f"- Minorantes aplicadas: {frac_list_str(minorantes)} (cumular={'sim' if cfg.cumular_minorantes else 'não'})")
+    st.write(f"- **Pena Final:** {formatar_pena(res.pena_fase3_dias)}")
+
+    st.markdown("#### Regime e Substituição")
+    st.write(f"- **Regime inicial (heurística art. 33 CP):** {res.regime_inicial}")
+    st.write(f"- **Substituição por restritivas (art. 44 CP):** {'Possível (em tese)' if res.substituivel_por_restritiva else 'Não elegível (em tese)'}")
+
+    st.caption("Observação: parâmetros e heurísticas são didáticos e podem variar conforme lei especial, súmulas e precedentes.")
+
+    # Download do relatório em .txtrelatorio_txt = gerar_relatorio_texto(caso, cfg, res)
+    st.download_button(
+        label="⬇️ Baixar relatório (.txt)",
+        data=relatorio_txt.encode("utf-8"),
+        file_name="relatorio_penal.txt",
+        mime="text/plain"
+    )
