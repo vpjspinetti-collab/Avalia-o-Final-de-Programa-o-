@@ -1,10 +1,3 @@
-# =========================
-# Simulador de Pena (Brasil) – Streamlit
-# Fases: 1) Pena-base (art. 59) -> 2) Agravantes/Atenuantes -> 3) Majorantes/Minorantes
-# Extras: regime inicial (art. 33) e substituição (art. 44)
-# Interface: mínima/máxima em ANOS (inteiros); pena-base em anos/meses/dias
-# =========================
-
 from dataclasses import dataclass, field
 from typing import List, Tuple
 import textwrap
@@ -333,7 +326,8 @@ if executar:
 
     st.caption("Observação: parâmetros e heurísticas são didáticos e podem variar conforme lei especial, súmulas e precedentes.")
 
-    # Download do relatório em .txtrelatorio_txt = gerar_relatorio_texto(caso, cfg, res)
+    # Download do relatório em .txt
+    relatorio_txt = gerar_relatorio_texto(caso, cfg, res)
     st.download_button(
         label="⬇️ Baixar relatório (.txt)",
         data=relatorio_txt.encode("utf-8"),
